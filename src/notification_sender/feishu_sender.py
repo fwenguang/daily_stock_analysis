@@ -5,6 +5,7 @@
 职责：
 1. 通过 webhook 发送飞书消息
 2. 通过飞书应用机器人（App Bot）发送消息（lark-oapi SDK）
+3. 支持通过飞书云文档 + 摘要卡片方式推送长报告
 """
 import base64
 import hashlib
@@ -15,6 +16,7 @@ import os
 import threading
 import time
 import uuid as uuid_mod
+from datetime import datetime as _dt
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -100,6 +102,12 @@ class FeishuSender:
         self._feishu_send_as_file = getattr(config, "feishu_send_as_file", False)
         self._webhook_verify_ssl = getattr(config, "webhook_verify_ssl", True)
 
+        # -- Feishu Cloud Doc mode (requires App Bot credentials + folder token) --
+        self._feishu_folder_token = (
+            getattr(config, "feishu_folder_token", None) or ""
+        ).strip()
+        self._feishu_doc_manager: Any = _NO_CLIENT  # lazy init, separate from app client
+
         # -- App Bot mode --
         self._feishu_app_id = (getattr(config, "feishu_app_id", None) or "").strip()
         self._feishu_app_secret = (getattr(config, "feishu_app_secret", None) or "").strip()
@@ -132,20 +140,127 @@ class FeishuSender:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _build_card_body(content: str) -> dict:
-        """Build a Feishu interactive-card body (without the ``msg_type`` wrapper)."""
+    def _build_card_body(content: str, doc_url: Optional[str] = None) -> dict:
+        """Build a Feishu interactive-card body (without the ``msg_type`` wrapper).
+
+        When *doc_url* is provided, an action button linking to the full Feishu
+        cloud document is appended at the bottom of the card.
+        """
+        elements: list = [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": content},
+            }
+        ]
+        if doc_url:
+            elements.append({"tag": "hr"})
+            elements.append({
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "📊 查看完整报告"},
+                        "type": "url",
+                        "url": doc_url,
+                    }
+                ],
+            })
         return {
             "config": {"wide_screen_mode": True},
             "header": {
                 "title": {"tag": "plain_text", "content": "股票智能分析报告"},
             },
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": content},
-                }
-            ],
+            "elements": elements,
         }
+
+    # ------------------------------------------------------------------
+    # Cloud Doc helpers (summary card + Feishu Doc link)
+    # ------------------------------------------------------------------
+
+    def _ensure_doc_manager(self) -> Any:
+        """Lazily initialise ``FeishuDocManager`` for cloud document creation.
+
+        Returns the manager instance on success, ``None`` when unavailable
+        (missing credentials / import error / config incomplete).
+        """
+        if self._feishu_doc_manager is not _NO_CLIENT:
+            return self._feishu_doc_manager
+        # Guard: doc manager requires App Bot credentials; folder_token is optional.
+        if not self._feishu_app_id or not self._feishu_app_secret:
+            logger.debug("飞书云文档需要 FEISHU_APP_ID + FEISHU_APP_SECRET，跳过文档模式")
+            self._feishu_doc_manager = None
+            return None
+        try:
+            from src.feishu_doc import FeishuDocManager
+        except ImportError as e:
+            logger.warning("FeishuDocManager 导入失败（缺少 lark-oapi SDK？）: %s", e)
+            self._feishu_doc_manager = None
+            return None
+        try:
+            manager = FeishuDocManager()
+            if not manager.is_configured():
+                logger.warning(
+                    "FeishuDocManager 配置不全"
+                    "（需要 FEISHU_APP_ID + FEISHU_APP_SECRET + FEISHU_FOLDER_TOKEN）"
+                )
+                self._feishu_doc_manager = None
+                return None
+            logger.info("FeishuDocManager 初始化成功")
+            self._feishu_doc_manager = manager
+            return manager
+        except Exception as e:
+            logger.error("FeishuDocManager 初始化失败: %s", e)
+            self._feishu_doc_manager = None
+            return None
+
+    def _try_create_feishu_doc(self, content: str) -> Optional[str]:
+        """Create a Feishu cloud document from *content* and return the doc URL.
+
+        Returns ``None`` when the doc manager is unavailable or creation fails.
+        The caller should fall back to the normal full-text card path.
+        """
+        manager = self._ensure_doc_manager()
+        if manager is None:
+            return None
+        date_str = _dt.now().strftime("%Y-%m-%d")
+        title = f"股票智能分析报告 {date_str}"
+        try:
+            doc_url = manager.create_daily_doc(title, content)
+            if doc_url:
+                logger.info("飞书云文档创建成功: %s", doc_url)
+                return doc_url
+            logger.warning("飞书云文档创建失败（返回空），回退为普通卡片消息")
+            return None
+        except Exception as e:
+            logger.error("飞书云文档创建异常: %s", e)
+            return None
+
+    @staticmethod
+    def _extract_card_summary(content: str, max_chars: int = 2000) -> str:
+        """Extract a readable summary from the full report for use in a card.
+
+        Strategy:
+        1. Cut at the first ``### `` heading (individual stock analysis).
+        2. If that range is still too long, fall back to character-based
+           truncation at the last newline before *max_chars*.
+        3. If the whole content is already short, return it as-is.
+        """
+        if len(content) <= max_chars:
+            return content.strip()
+
+        # Try to extract everything before the first individual stock section.
+        first_h3 = content.find("\n### ")
+        if first_h3 > 0:
+            candidate = content[:first_h3].strip()
+            if len(candidate) <= max_chars:
+                return candidate
+
+        # Fallback: truncate at last complete line before max_chars.
+        truncated = content[:max_chars]
+        last_nl = truncated.rfind("\n")
+        if last_nl > max_chars // 2:
+            return truncated[:last_nl].rstrip() + "\n\n…"
+        return truncated.rstrip() + "\n\n…"
 
     # ------------------------------------------------------------------
     # Webhook helpers (unchanged legacy path)
@@ -361,8 +476,11 @@ class FeishuSender:
         Push a message to Feishu.
 
         Routing priority:
-          1. **Webhook** – when ``feishu_webhook_url`` is configured.
-          2. **App Bot** – when ``feishu_app_id`` + ``feishu_app_secret``
+          1. **Doc card** – when ``FEISHU_FOLDER_TOKEN`` + App Bot credentials
+             are all configured and doc creation succeeds, a summary card with a
+             "查看完整报告" button linking to a Feishu cloud document is sent.
+          2. **Webhook** – when ``feishu_webhook_url`` is configured.
+          3. **App Bot** – when ``feishu_app_id`` + ``feishu_app_secret``
              + ``feishu_chat_id`` are all configured and webhook is absent.
 
         Returns:
@@ -371,9 +489,49 @@ class FeishuSender:
         if content is None:
             logger.error("send_to_feishu: content 不能为 None")
             return False
+
+        # --- Doc card path: create Feishu cloud doc, send summary + link ---
+        # Doc mode requires App Bot credentials; folder_token is optional.
+        if self._feishu_app_id and self._feishu_app_secret:
+            doc_url = self._try_create_feishu_doc(content)
+            if doc_url:
+                summary = self._extract_card_summary(content)
+                ok = self._send_doc_card(summary, doc_url, timeout_seconds=timeout_seconds)
+                if ok:
+                    return True
+                logger.warning("文档卡片发送失败，回退为普通消息")
+
+        # --- Legacy paths ---
         if self._feishu_url:
             return self._send_via_webhook(content, timeout_seconds=timeout_seconds)
         return self._send_via_app_bot(content)
+
+    def _send_doc_card(
+        self,
+        summary: str,
+        doc_url: str,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
+        """Send a summary card with a "查看完整报告" button linking to *doc_url*.
+
+        Routes through the same channel as normal messages (webhook or App Bot).
+        """
+        formatted = format_feishu_markdown(summary)
+        prepared = self._apply_keyword_prefix(formatted)
+        card_body = self._build_card_body(prepared, doc_url=doc_url)
+
+        # -- Webhook path --
+        if self._feishu_url:
+            card_payload = {"msg_type": "interactive", "card": card_body}
+            return self._post_webhook_payload(card_payload, timeout_seconds=timeout_seconds)
+
+        # -- App Bot path --
+        client = self._ensure_app_client()
+        if client is None:
+            return False
+        card_json = json.dumps(card_body, ensure_ascii=False)
+        return self._app_send_raw(client, "interactive", card_json)
 
     def send_feishu_file(self, file_path: str) -> bool:
         """
@@ -551,55 +709,59 @@ class FeishuSender:
                 time.sleep(1)
         return success_count == total_chunks
 
+    def _post_webhook_payload(
+        self,
+        payload: Dict[str, Any],
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
+        """POST *payload* to the webhook URL with security fields attached."""
+        request_payload = dict(payload)
+        request_payload.update(self._build_security_fields())
+        try:
+            response = requests.post(
+                self._feishu_url,
+                json=request_payload,
+                timeout=timeout_seconds or _WEBHOOK_SEND_TIMEOUT_SECONDS,
+                verify=self._webhook_verify_ssl,
+            )
+        except (requests.exceptions.ConnectionError,
+                requests.exceptions.Timeout,
+                requests.exceptions.RequestException) as e:
+            logger.error("飞书 Webhook 网络请求异常: %s", e)
+            return False
+        if response.status_code == 200:
+            try:
+                result = response.json()
+            except (ValueError, AttributeError):
+                logger.error("飞书 Webhook 返回非 JSON 响应: %s", response.text[:200])
+                return False
+            if not isinstance(result, dict):
+                logger.error("飞书 Webhook 返回非预期格式: %s", type(result).__name__)
+                return False
+            code = result.get("code") if "code" in result else result.get("StatusCode")
+            if code == 0:
+                logger.info("飞书 Webhook 消息发送成功")
+                return True
+            logger.error(
+                "飞书 Webhook 返回错误 [code=%s]: %s",
+                code,
+                result.get("msg") or result.get("StatusMessage", "未知错误"),
+            )
+            return False
+        logger.error("飞书 Webhook 请求失败: HTTP %d", response.status_code)
+        return False
+
     def _send_feishu_message(self, content: str, *, timeout_seconds: Optional[float] = None) -> bool:
         """Send a single Feishu webhook message (interactive card, fallback text)."""
         prepared_content = self._apply_keyword_prefix(content)
-        security_fields = self._build_security_fields()
-
-        def _post_payload(payload: Dict[str, Any]) -> bool:
-            request_payload = dict(payload)
-            request_payload.update(security_fields)
-            try:
-                response = requests.post(
-                    self._feishu_url,
-                    json=request_payload,
-                    timeout=timeout_seconds or _WEBHOOK_SEND_TIMEOUT_SECONDS,
-                    verify=self._webhook_verify_ssl,
-                )
-            except (requests.exceptions.ConnectionError,
-                     requests.exceptions.Timeout,
-                     requests.exceptions.RequestException) as e:
-                logger.error("飞书 Webhook 网络请求异常: %s", e)
-                return False
-            if response.status_code == 200:
-                try:
-                    result = response.json()
-                except (ValueError, AttributeError):
-                    logger.error("飞书 Webhook 返回非 JSON 响应: %s", response.text[:200])
-                    return False
-                if not isinstance(result, dict):
-                    logger.error("飞书 Webhook 返回非预期格式: %s", type(result).__name__)
-                    return False
-                code = result.get("code") if "code" in result else result.get("StatusCode")
-                if code == 0:
-                    logger.info("飞书 Webhook 消息发送成功")
-                    return True
-                logger.error(
-                    "飞书 Webhook 返回错误 [code=%s]: %s",
-                    code,
-                    result.get("msg") or result.get("StatusMessage", "未知错误"),
-                )
-                return False
-            logger.error("飞书 Webhook 请求失败: HTTP %d", response.status_code)
-            return False
 
         card_payload = {"msg_type": "interactive", "card": self._build_card_body(prepared_content)}
-
-        if _post_payload(card_payload):
+        if self._post_webhook_payload(card_payload, timeout_seconds=timeout_seconds):
             return True
 
         text_payload = {
             "msg_type": "text",
             "content": {"text": prepared_content},
         }
-        return _post_payload(text_payload)
+        return self._post_webhook_payload(text_payload, timeout_seconds=timeout_seconds)

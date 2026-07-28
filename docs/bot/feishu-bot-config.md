@@ -69,6 +69,52 @@ FEISHU_SEND_AS_FILE=true
 - **GitHub Actions 定时任务**：已通过 `.github/workflows/00-daily-analysis.yml` 映射，在 repo Settings → Secrets and variables → Actions 中添加同名变量或 secret 即可启用
 - **配置方式**：支持 `.env` 文件、GitHub Actions Secret/Variable 或 Web/桌面设置页配置
 
+### 卡片摘要 + 云文档模式（FEISHU_FOLDER_TOKEN）
+
+当报告内容较长时，可开启此模式：系统自动将完整报告创建为飞书云文档，同时向群内发送仅含摘要的卡片消息，卡片底部带 **"📊 查看完整报告"** 按钮，点击即跳转到飞书文档阅读全文。
+
+**前提条件：**
+
+1. 已完成飞书企业自建应用的创建与发布
+2. 应用已开启以下权限：
+   - `docx:document` — 创建/编辑云文档
+   - `drive:drive` — 访问云空间文件夹
+   - `im:message` — 发送消息
+3. 在飞书云文档中创建（或选择一个）存放报告的文件夹
+
+**获取 FEISHU_FOLDER_TOKEN：**
+
+打开飞书客户端 → 云文档 → 进入目标文件夹 → 复制浏览器地址栏 URL：
+
+```
+https://xxx.feishu.cn/drive/folder/XXXXXXXXXX
+                                   ↑ 这就是 Folder Token
+```
+
+**配置示例：**
+
+```env
+# 必须：App Bot 凭据
+FEISHU_APP_ID=cli_xxxxxxxx
+FEISHU_APP_SECRET=your_app_secret
+
+# 必须：发送目标群
+FEISHU_CHAT_ID=oc_xxxxxxxx
+
+# 必须：云文档存放目录
+FEISHU_FOLDER_TOKEN=XXXXXXXXXX
+
+# 可选：若同时配置了 Webhook URL，卡片会通过 Webhook 发送，但文档仍用 SDK 创建
+FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/xxx
+```
+
+**行为说明：**
+
+- 发送报告时，优先尝试创建云文档
+- 成功 → 发送摘要卡片 + 文档链接按钮
+- 失败 → 自动回退为普通全文卡片/文字消息（不影响通知送达）
+- 系统通知、告警等非报告消息不受影响
+
 ## Webhook 推送的正确配置步骤
 
 ### 1. 在飞书群里创建自定义机器人
