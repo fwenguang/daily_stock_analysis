@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -129,6 +130,10 @@ class FeishuDocManager:
                     logger.error(f"写入文档内容失败(批次{i}): {write_resp.code} - {write_resp.msg}")
 
             logger.info(f"文档内容写入完成")
+
+            # 3. 设置文档权限为组织内可读（群成员可打开）
+            self._set_doc_public(doc_id)
+
             return doc_url
 
         except Exception as e:
@@ -175,6 +180,40 @@ class FeishuDocManager:
         })
         self._save_registry(registry)
         logger.debug("文档已记录: %s (%s)", title, doc_id)
+
+    def _set_doc_public(self, doc_id: str) -> bool:
+        """将文档设置为组织内任何人可通过链接查看。"""
+        if self.client is None:
+            return False
+        try:
+            from lark_oapi.api.drive.v1 import (
+                PatchPermissionPublicRequest,
+                PermissionPublicRequest,
+            )
+
+            req = (
+                PatchPermissionPublicRequest.builder()
+                .token(doc_id)
+                .type("docx")
+                .request_body(
+                    PermissionPublicRequest.builder()
+                    .link_share_entity("tenant_readable")
+                    .build()
+                )
+                .build()
+            )
+            resp = self.client.drive.v1.permission_public.patch(req)
+            if resp.success():
+                logger.info("文档权限已设为组织内可读: %s", doc_id)
+                return True
+            logger.warning(
+                "设置文档权限失败 (%s): code=%s msg=%s",
+                doc_id, resp.code, resp.msg,
+            )
+            return False
+        except Exception as e:
+            logger.warning("设置文档权限异常 (%s): %s", doc_id, e)
+            return False
 
     def _delete_doc(self, doc_id: str) -> bool:
         """通过 Drive API 删除单个文档。"""
@@ -325,53 +364,127 @@ class FeishuDocManager:
         """将 Markdown 转换为飞书 SDK 的 Block 对象。
 
         支持：标题（H1-H3）、分割线、无序列表、行内格式（粗体/斜体/行内代码/链接）。
-        表格和引用块保持原文输出。
+        表格转换为键值对列表格式。
         """
         from lark_oapi.api.docx.v1 import TextStyle
 
         blocks: List = []
+        table_buffer: List[str] = []
         lines = md_text.split("\n")
 
         for line in lines:
             stripped = line.strip()
-            if not stripped:
+
+            # 缓冲表格行（以 | 开头且以 | 结尾）
+            if stripped.startswith("|") and stripped.endswith("|"):
+                table_buffer.append(stripped)
                 continue
 
-            text_content = stripped
+            # 刷新表格缓冲区
+            if table_buffer:
+                self._flush_table_buffer(table_buffer, blocks)
+                table_buffer = []
+
+            if not stripped:
+                continue
 
             # 标题
             if stripped.startswith("# ") and not stripped.startswith("## "):
                 text_content = stripped[2:]
                 elements = self._parse_inline_to_elements(text_content)
                 text_obj = Text.builder().elements(elements).style(TextStyle.builder().build()).build()
-                block = Block.builder().block_type(3).heading1(text_obj).build()
-                blocks.append(block)
+                blocks.append(Block.builder().block_type(3).heading1(text_obj).build())
                 continue
             if stripped.startswith("## ") and not stripped.startswith("### "):
                 text_content = stripped[3:]
                 elements = self._parse_inline_to_elements(text_content)
                 text_obj = Text.builder().elements(elements).style(TextStyle.builder().build()).build()
-                block = Block.builder().block_type(4).heading2(text_obj).build()
-                blocks.append(block)
+                blocks.append(Block.builder().block_type(4).heading2(text_obj).build())
                 continue
             if stripped.startswith("### "):
                 text_content = stripped[4:]
                 elements = self._parse_inline_to_elements(text_content)
                 text_obj = Text.builder().elements(elements).style(TextStyle.builder().build()).build()
-                block = Block.builder().block_type(5).heading3(text_obj).build()
-                blocks.append(block)
+                blocks.append(Block.builder().block_type(5).heading3(text_obj).build())
                 continue
 
             # 分割线
-            if stripped == "---" or stripped == "***":
+            if stripped in ("---", "***"):
                 div = Divider.builder().build()
                 blocks.append(Block.builder().block_type(22).divider(div).build())
                 continue
 
-            # 普通文本（保留原有前缀如 - / > 等）
+            # 普通文本
             elements = self._parse_inline_to_elements(stripped)
             text_obj = Text.builder().elements(elements).style(TextStyle.builder().build()).build()
-            block = Block.builder().block_type(2).text(text_obj).build()
-            blocks.append(block)
+            blocks.append(Block.builder().block_type(2).text(text_obj).build())
+
+        # 刷新末尾的表格缓冲区
+        if table_buffer:
+            self._flush_table_buffer(table_buffer, blocks)
 
         return blocks
+
+    def _flush_table_buffer(self, table_buffer: List[str], blocks: List) -> None:
+        """将 Markdown 表格行转换为键值对列表并追加到 *blocks*。"""
+        from lark_oapi.api.docx.v1 import TextStyle
+
+        if not table_buffer:
+            return
+
+        # 解析表格
+        rows: List[List[str]] = []
+        for line in table_buffer:
+            cells = [c.strip() for c in line.split("|")]
+            cells = [c for c in cells if c]  # 去掉首尾空串
+            if not cells:
+                continue
+            # 跳过分隔行（如 |---|---|）
+            if all(re.match(r"^:?-{2,}:?$", c) for c in cells):
+                continue
+            rows.append(cells)
+
+        if len(rows) < 2:
+            # 单行表格，当成普通文本
+            for line in table_buffer:
+                elements = self._parse_inline_to_elements(line)
+                text_obj = Text.builder().elements(elements).style(TextStyle.builder().build()).build()
+                blocks.append(Block.builder().block_type(2).text(text_obj).build())
+            return
+
+        header = rows[0]
+        data_rows = rows[1:]
+
+        # 先加一个空行作为视觉分隔
+        empty = Text.builder().elements(
+            self._parse_inline_to_elements("")
+        ).style(TextStyle.builder().build()).build()
+        blocks.append(Block.builder().block_type(2).text(empty).build())
+
+        for row in data_rows:
+            # 补齐列数
+            while len(row) < len(header):
+                row.append("")
+            parts = []
+            for idx, cell in enumerate(row):
+                key = header[idx] if idx < len(header) else f"列{idx + 1}"
+                # 将 cell 内容中的 markdown 转为飞书行内格式
+                cell_elements = self._parse_inline_to_elements(cell)
+                # 将 key 加粗
+                key_style = TextElementStyle.builder().bold(True).build()
+                key_tr = TextRun.builder().content(key).text_element_style(key_style).build()
+                key_el = TextElement.builder().text_run(key_tr).build()
+
+                colon_tr = TextRun.builder().content("：").text_element_style(
+                    TextElementStyle.builder().build()
+                ).build()
+                colon_el = TextElement.builder().text_run(colon_tr).build()
+
+                all_elements = [key_el, colon_el] + cell_elements
+                text_obj = Text.builder().elements(all_elements).style(
+                    TextStyle.builder().build()
+                ).build()
+                blocks.append(Block.builder().block_type(2).text(text_obj).build())
+
+        # 空行结尾
+        blocks.append(Block.builder().block_type(2).text(empty).build())
