@@ -168,7 +168,7 @@ class FeishuSender:
         return {
             "config": {"wide_screen_mode": True},
             "header": {
-                "title": {"tag": "plain_text", "content": "股票智能分析报告"},
+                "title": {"tag": "plain_text", "content": "Daily Report"},
             },
             "elements": elements,
         }
@@ -222,8 +222,8 @@ class FeishuSender:
         manager = self._ensure_doc_manager()
         if manager is None:
             return None
-        date_str = _dt.now().strftime("%Y-%m-%d")
-        title = f"股票智能分析报告 {date_str}"
+        date_str = _dt.now().strftime("%Y%m%d_%H")
+        title = f"daily_report_{date_str}"
         try:
             doc_url = manager.create_daily_doc(title, content)
             if doc_url:

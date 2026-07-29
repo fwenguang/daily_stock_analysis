@@ -1,16 +1,28 @@
 # feishu_doc.py
 # -*- coding: utf-8 -*-
+import io
 import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
 import lark_oapi as lark
 from lark_oapi.api.docx.v1 import *
-from lark_oapi.api.drive.v1 import DeleteFileRequest
+from lark_oapi.api.drive.v1 import (
+    CreateFolderFileRequest,
+    CreateFolderFileRequestBody,
+    CreateImportTaskRequest,
+    DeleteFileRequest,
+    GetImportTaskRequest,
+    ImportTask,
+    ImportTaskMountPoint,
+    UploadAllFileRequest,
+    UploadAllFileRequestBody,
+)
 from src.config import get_config
 
 logger = logging.getLogger(__name__)
@@ -29,6 +41,7 @@ class FeishuDocManager:
         self.folder_token = self.config.feishu_folder_token
         self._retention_days = int(getattr(self.config, "feishu_doc_retention_days", 0) or 0)
         self._registry_path = _DEFAULT_REGISTRY_PATH
+        self._pending_tables: List = []  # (header, rows) accumulated during markdown parsing
 
         # 解析域名：feishu(飞书国内) / lark(国际版)
         raw_domain = (
@@ -58,89 +71,218 @@ class FeishuDocManager:
             self.client = None
 
     def is_configured(self) -> bool:
-        """检查配置是否完整"""
+        """检查配置是否完整（需要 FEISHU_APP_ID + FEISHU_APP_SECRET，文件夹自动创建）"""
         return bool(self.app_id and self.app_secret)
+
+    def _ensure_folder_token(self) -> Optional[str]:
+        """确保有应用可写入的文件夹 token。
+
+        优先级：
+        1. 使用 .env 中配置的 FEISHU_FOLDER_TOKEN
+        2. 使用注册表中缓存的自动创建的文件夹 token
+        3. 通过 API 自动创建一个应用所属的文件夹
+
+        Returns:
+            有效的文件夹 token，失败返回 None。
+        """
+        # 1. 检查配置的 folder_token
+        if self.folder_token:
+            return self.folder_token
+
+        # 2. 检查注册表中的缓存
+        registry = self._load_registry()
+        cached_token = registry.get("auto_folder_token", "")
+        if cached_token:
+            logger.debug("使用注册表中缓存的文件夹 token: %s", cached_token)
+            self.folder_token = cached_token
+            return cached_token
+
+        # 3. 通过 API 在应用根目录自动创建文件夹（folder_token='' 表示根目录）
+        try:
+            body = (
+                CreateFolderFileRequestBody.builder()
+                .name("daily_reports")
+                .folder_token("")
+                .build()
+            )
+            req = (
+                CreateFolderFileRequest.builder()
+                .request_body(body)
+                .build()
+            )
+            resp = self.client.drive.v1.file.create_folder(req)
+            if resp.success() and resp.data and resp.data.token:
+                new_token = resp.data.token
+                registry["auto_folder_token"] = new_token
+                self._save_registry(registry)
+                self.folder_token = new_token
+                logger.info("自动创建日报文件夹成功: token=%s", new_token)
+                return new_token
+            logger.error(
+                "自动创建文件夹失败: code=%s msg=%s",
+                getattr(resp, "code", "?"), getattr(resp, "msg", "?"),
+            )
+        except Exception as e:
+            logger.error("自动创建文件夹异常: %s", e)
+
+        return None
 
     def create_daily_doc(self, title: str, content_md: str) -> Optional[str]:
         """
-        创建日报文档
+        创建日报文档（Markdown 导入方式，效果等同于在飞书文档中粘贴 Markdown）。
 
         流程：
         1. 清理过期文档（若配置了 FEISHU_DOC_RETENTION_DAYS）
-        2. 创建新文档并写入内容
-        3. 记录新文档到注册表
+        2. 上传 Markdown 文件到飞书云盘
+        3. 通过 import_task API 将 Markdown 导入为飞书文档
+        4. 轮询等待导入完成
+        5. 记录新文档到注册表
+        6. 设置文档权限为公开可读
         """
         if not self.client or not self.is_configured():
             logger.warning("飞书 SDK 未初始化或配置缺失，跳过创建")
             return None
 
-        # 0. 先清理过期文档（不影响新文档创建）
+        # 0. 确保文件夹 token 有效（没有则自动创建一个应用所属的文件夹）
+        folder_token = self._ensure_folder_token()
+        if not folder_token:
+            logger.error("无法获取有效的文件夹 token，跳过创建")
+            return None
+
+        # 1. 先清理过期文档（不影响新文档创建）
         self._cleanup_expired_docs()
 
         try:
-            # 1. 创建文档
-            # 使用官方 SDK 的 Builder 模式构造请求
-            # folder_token 可选：不传则存到应用"我的空间"根目录
-            body_builder = CreateDocumentRequestBody.builder() \
-                .title(title)
-            if self.folder_token:
-                body_builder = body_builder.folder_token(self.folder_token)
-            create_request = CreateDocumentRequest.builder() \
-                .request_body(body_builder.build()) \
+            # 2. 上传 Markdown 内容为文件
+            content_bytes = content_md.encode("utf-8")
+            file_obj = io.BytesIO(content_bytes)
+            upload_body = (
+                UploadAllFileRequestBody.builder()
+                .file_name(f"{title}.md")
+                .parent_type("explorer")
+                .size(len(content_bytes))
+                .file(file_obj)
                 .build()
+            )
+            upload_resp = self.client.drive.v1.file.upload_all(
+                UploadAllFileRequest.builder().request_body(upload_body).build()
+            )
+            if not upload_resp.success():
+                logger.error(
+                    "上传 Markdown 文件失败: code=%s msg=%s",
+                    upload_resp.code, upload_resp.msg,
+                )
+                return None
+            file_token = upload_resp.data.file_token
+            logger.debug("Markdown 文件上传成功, file_token=%s", file_token)
 
-            response = self.client.docx.v1.document.create(create_request)
+            # 3. 创建导入任务（md → docx）
+            # 注意：飞书 API 要求 mount_type=1 + mount_key（文件夹 token）
+            mp = (
+                ImportTaskMountPoint.builder()
+                .mount_type(1)
+                .mount_key(folder_token)
+                .build()
+            )
+            import_task = (
+                ImportTask.builder()
+                .file_token(file_token)
+                .file_extension("md")
+                .type("docx")
+                .file_name(title)
+                .point(mp)
+                .build()
+            )
+            import_resp = self.client.drive.v1.import_task.create(
+                CreateImportTaskRequest.builder().request_body(import_task).build()
+            )
+            if not import_resp.success():
+                err_detail = ""
+                if import_resp.error and hasattr(import_resp.error, "field_violations"):
+                    err_detail = f" violations={import_resp.error.field_violations}"
+                logger.error(
+                    "创建导入任务失败: code=%s msg=%s%s",
+                    import_resp.code, import_resp.msg, err_detail,
+                )
+                return None
+            ticket = import_resp.data.ticket
+            logger.debug("导入任务已创建, ticket=%s", ticket)
 
-            if not response.success():
-                logger.error(f"创建文档失败: {response.code} - {response.msg} - {response.error}")
+            # 4. 轮询等待导入完成
+            doc_token = self._poll_import_task(ticket)
+            if not doc_token:
+                logger.error("导入任务未完成，未能获取文档 token")
                 return None
 
-            doc_id = response.data.document.document_id
-            # 这里的 domain 只是为了生成链接，实际访问会重定向
-            doc_url = f"https://feishu.cn/docx/{doc_id}"
-            logger.info(f"飞书文档创建成功: {title} (ID: {doc_id})")
+            doc_url = f"https://feishu.cn/docx/{doc_token}"
+            logger.info("飞书文档创建成功: %s (ID: %s)", title, doc_token)
 
-            # 1.5 记录新文档到注册表（用于后续自动清理）
-            self._record_doc(doc_id, doc_url, title)
+            # 5. 记录新文档到注册表（用于后续自动清理）
+            self._record_doc(doc_token, doc_url, title)
 
-            # 2. 解析 Markdown 并写入内容
-            # 将 Markdown 转换为 SDK 需要的 Block 对象列表
-            blocks = self._markdown_to_sdk_blocks(content_md)
-
-            # 飞书 API 限制每次写入 Block 数量（建议 50 个左右），分批写入
-            batch_size = 50
-            doc_block_id = doc_id  # 文档本身也是一个 block
-
-            for i in range(0, len(blocks), batch_size):
-                batch_blocks = blocks[i:i + batch_size]
-
-                # 构造批量添加块的请求
-                batch_add_request = CreateDocumentBlockChildrenRequest.builder() \
-                    .document_id(doc_id) \
-                    .block_id(doc_block_id) \
-                    .request_body(CreateDocumentBlockChildrenRequestBody.builder()
-                                  .children(batch_blocks)  # SDK 需要 Block 对象列表
-                                  .index(-1)  # 追加到末尾
-                                  .build()) \
-                    .build()
-
-                write_resp = self.client.docx.v1.document_block_children.create(batch_add_request)
-
-                if not write_resp.success():
-                    logger.error(f"写入文档内容失败(批次{i}): {write_resp.code} - {write_resp.msg}")
-
-            logger.info(f"文档内容写入完成")
-
-            # 3. 设置文档权限为组织内可读（群成员可打开）
-            self._set_doc_public(doc_id)
+            # 6. 设置文档权限为公开可读（群成员+外部人员均可访问）
+            self._set_doc_public(doc_token)
 
             return doc_url
 
         except Exception as e:
-            logger.error(f"飞书文档操作异常: {e}")
+            logger.error("飞书文档操作异常: %s", e)
             import traceback
             logger.error(traceback.format_exc())
             return None
+
+    def _poll_import_task(self, ticket: str, max_retries: int = 15, interval: float = 1.0) -> Optional[str]:
+        """轮询导入任务结果，返回导入完成后的文档 token。
+
+        Args:
+            ticket: 导入任务 ticket。
+            max_retries: 最大轮询次数（默认 15 次）。
+            interval: 每次轮询间隔秒数（默认 1.0 秒）。
+
+        Returns:
+            导入成功时返回文档 token，失败/超时返回 None。
+        """
+        for i in range(max_retries):
+            time.sleep(interval)
+            get_resp = self.client.drive.v1.import_task.get(
+                GetImportTaskRequest.builder().ticket(ticket).build()
+            )
+            if not get_resp.success():
+                logger.warning(
+                    "查询导入任务失败 [%d/%d]: code=%s msg=%s",
+                    i + 1, max_retries, get_resp.code, get_resp.msg,
+                )
+                continue
+
+            result = get_resp.data.result
+            if result is None:
+                logger.warning("查询导入任务返回空结果 [%d/%d]", i + 1, max_retries)
+                continue
+
+            job_status = getattr(result, "job_status", None)
+            err_msg = getattr(result, "job_error_msg", "") or ""
+            logger.debug(
+                "导入任务状态 [%d/%d]: job_status=%s, err_msg=%s",
+                i + 1, max_retries, job_status, err_msg,
+            )
+
+            if job_status == 0:  # 完成
+                doc_token = getattr(result, "token", "") or ""
+                if doc_token and err_msg == "success":
+                    logger.info("导入任务完成, token=%s", doc_token)
+                    return doc_token
+                logger.warning(
+                    "导入任务结束但状态异常: job_status=0, err_msg=%s, token=%s",
+                    err_msg, doc_token,
+                )
+                return None
+            elif job_status is not None and job_status < 0:  # 负值表示失败
+                logger.error("导入任务失败: job_status=%s, err_msg=%s", job_status, err_msg)
+                return None
+            # job_status > 0 表示排队/处理中，继续轮询
+
+        logger.error("导入任务轮询超时（%d 次）", max_retries)
+        return None
 
     # ------------------------------------------------------------------
     # Doc registry & auto-cleanup
@@ -182,7 +324,7 @@ class FeishuDocManager:
         logger.debug("文档已记录: %s (%s)", title, doc_id)
 
     def _set_doc_public(self, doc_id: str) -> bool:
-        """将文档设置为组织内任何人可通过链接查看。"""
+        """将文档设置为任何人可通过链接查看（组织内外均可）。"""
         if self.client is None:
             return False
         try:
@@ -191,20 +333,23 @@ class FeishuDocManager:
                 PermissionPublicRequest,
             )
 
+            body = (
+                PermissionPublicRequest.builder()
+                .external_access(True)
+                .invite_external(True)
+                .link_share_entity("anyone_readable")
+                .build()
+            )
             req = (
                 PatchPermissionPublicRequest.builder()
                 .token(doc_id)
                 .type("docx")
-                .request_body(
-                    PermissionPublicRequest.builder()
-                    .link_share_entity("tenant_readable")
-                    .build()
-                )
+                .request_body(body)
                 .build()
             )
             resp = self.client.drive.v1.permission_public.patch(req)
             if resp.success():
-                logger.info("文档权限已设为组织内可读: %s", doc_id)
+                logger.info("文档权限已设为公开可读: %s", doc_id)
                 return True
             logger.warning(
                 "设置文档权限失败 (%s): code=%s msg=%s",
@@ -364,10 +509,11 @@ class FeishuDocManager:
         """将 Markdown 转换为飞书 SDK 的 Block 对象。
 
         支持：标题（H1-H3）、分割线、无序列表、行内格式（粗体/斜体/行内代码/链接）。
-        表格转换为键值对列表格式。
+        表格暂存到 _pending_tables，由 _create_real_table 生成真表格。
         """
         from lark_oapi.api.docx.v1 import TextStyle
 
+        self._pending_tables = []
         blocks: List = []
         table_buffer: List[str] = []
         lines = md_text.split("\n")
@@ -426,26 +572,22 @@ class FeishuDocManager:
         return blocks
 
     def _flush_table_buffer(self, table_buffer: List[str], blocks: List) -> None:
-        """将 Markdown 表格行转换为键值对列表并追加到 *blocks*。"""
-        from lark_oapi.api.docx.v1 import TextStyle
-
+        """解析 Markdown 表格，暂存到 _pending_tables 用于后续创建真表格。"""
         if not table_buffer:
             return
 
-        # 解析表格
         rows: List[List[str]] = []
         for line in table_buffer:
             cells = [c.strip() for c in line.split("|")]
-            cells = [c for c in cells if c]  # 去掉首尾空串
+            cells = [c for c in cells if c]
             if not cells:
                 continue
-            # 跳过分隔行（如 |---|---|）
             if all(re.match(r"^:?-{2,}:?$", c) for c in cells):
                 continue
             rows.append(cells)
 
         if len(rows) < 2:
-            # 单行表格，当成普通文本
+            from lark_oapi.api.docx.v1 import TextStyle
             for line in table_buffer:
                 elements = self._parse_inline_to_elements(line)
                 text_obj = Text.builder().elements(elements).style(TextStyle.builder().build()).build()
@@ -455,36 +597,146 @@ class FeishuDocManager:
         header = rows[0]
         data_rows = rows[1:]
 
-        # 先加一个空行作为视觉分隔
+        # 宽表（>3列）转竖排键值对，避免真表格被挤扁
+        if len(header) > 3:
+            self._flush_wide_table_as_kv(header, data_rows, blocks)
+            return
+
+        # 窄表（≤3列）暂存，后续创建真表格
+        self._pending_tables.append((header, data_rows))
+        from lark_oapi.api.docx.v1 import TextStyle
         empty = Text.builder().elements(
             self._parse_inline_to_elements("")
         ).style(TextStyle.builder().build()).build()
         blocks.append(Block.builder().block_type(2).text(empty).build())
 
-        for row in data_rows:
-            # 补齐列数
+    def _flush_wide_table_as_kv(
+        self, header: List[str], rows: List[List[str]], blocks: List
+    ) -> None:
+        """将宽表（>3列）转竖排键值对，每个数据行输出一组加粗标题: 值的行。"""
+        from lark_oapi.api.docx.v1 import TextStyle
+
+        empty = Text.builder().elements(
+            self._parse_inline_to_elements("")
+        ).style(TextStyle.builder().build()).build()
+        blocks.append(Block.builder().block_type(2).text(empty).build())
+
+        for row_idx, row in enumerate(rows):
             while len(row) < len(header):
                 row.append("")
-            parts = []
-            for idx, cell in enumerate(row):
-                key = header[idx] if idx < len(header) else f"列{idx + 1}"
-                # 将 cell 内容中的 markdown 转为飞书行内格式
-                cell_elements = self._parse_inline_to_elements(cell)
-                # 将 key 加粗
+            # 多行之间加分割
+            if row_idx > 0:
+                div = Divider.builder().build()
+                blocks.append(Block.builder().block_type(22).divider(div).build())
+
+            for col_idx, cell in enumerate(row):
+                key = header[col_idx] if col_idx < len(header) else ""
                 key_style = TextElementStyle.builder().bold(True).build()
                 key_tr = TextRun.builder().content(key).text_element_style(key_style).build()
                 key_el = TextElement.builder().text_run(key_tr).build()
-
                 colon_tr = TextRun.builder().content("：").text_element_style(
                     TextElementStyle.builder().build()
                 ).build()
                 colon_el = TextElement.builder().text_run(colon_tr).build()
-
-                all_elements = [key_el, colon_el] + cell_elements
-                text_obj = Text.builder().elements(all_elements).style(
-                    TextStyle.builder().build()
-                ).build()
+                cell_elements = self._parse_inline_to_elements(cell)
+                all_el = [key_el, colon_el] + cell_elements
+                text_obj = Text.builder().elements(all_el).style(TextStyle.builder().build()).build()
                 blocks.append(Block.builder().block_type(2).text(text_obj).build())
 
-        # 空行结尾
         blocks.append(Block.builder().block_type(2).text(empty).build())
+
+    def _create_real_table(
+        self, doc_id: str, header: List[str], rows: List[List[str]]
+    ) -> None:
+        """在文档中创建一个真实的飞书表格并填充单元格内容。"""
+        if self.client is None:
+            return
+
+        col_count = len(header)
+        row_count = len(rows)
+        if row_count < 1 or col_count < 1:
+            logger.warning("跳过空表格: %d行 %d列", row_count, col_count)
+            return
+
+        # 补齐每行列数
+        for r in rows:
+            while len(r) < col_count:
+                r.append("")
+
+        try:
+            from lark_oapi.api.docx.v1 import (
+                CreateDocumentBlockChildrenRequest,
+                CreateDocumentBlockChildrenRequestBody,
+                TableProperty,
+                TextStyle,
+            )
+            from lark_oapi.api.docx.v1 import Table as FeishuTable
+
+            # 1. 创建 Table block（服务器自动生成占位单元格）
+            table_prop = TableProperty.builder().row_size(row_count).column_size(col_count).header_row(True).build()
+            table_obj = FeishuTable.builder().property(table_prop).build()
+            table_block = Block.builder().block_type(31).table(table_obj).build()
+
+            req = (
+                CreateDocumentBlockChildrenRequest.builder()
+                .document_id(doc_id)
+                .block_id(doc_id)
+                .request_body(
+                    CreateDocumentBlockChildrenRequestBody.builder()
+                    .children([table_block])
+                    .index(-1)
+                    .build()
+                )
+                .build()
+            )
+            resp = self.client.docx.v1.document_block_children.create(req)
+            if not resp.success():
+                logger.warning("创建表格块失败: code=%s msg=%s", resp.code, resp.msg)
+                return
+            if not resp.data or not resp.data.children:
+                logger.warning("创建表格块返回空数据，跳过")
+                return
+
+            cell_ids = list(resp.data.children[0].children or [])
+            if len(cell_ids) < col_count * row_count:
+                logger.warning("表格单元格数量不足: 期望 %d 实际 %d", col_count * row_count, len(cell_ids))
+                return
+
+            # 2. 逐行填充单元格内容
+            for row_idx in range(row_count):
+                for col_idx in range(col_count):
+                    cell_id = cell_ids[row_idx * col_count + col_idx]
+                    cell_text = rows[row_idx][col_idx] if col_idx < len(rows[row_idx]) else ""
+                    if row_idx == 0:
+                        style = TextElementStyle.builder().bold(True).build()
+                        tr = TextRun.builder().content(cell_text).text_element_style(style).build()
+                        el = TextElement.builder().text_run(tr).build()
+                        cell_elements = [el]
+                    else:
+                        cell_elements = self._parse_inline_to_elements(cell_text)
+                    text_obj = Text.builder().elements(cell_elements).style(TextStyle.builder().build()).build()
+                    cell_block = Block.builder().block_type(2).text(text_obj).build()
+
+                    cell_req = (
+                        CreateDocumentBlockChildrenRequest.builder()
+                        .document_id(doc_id)
+                        .block_id(cell_id)
+                        .request_body(
+                            CreateDocumentBlockChildrenRequestBody.builder()
+                            .children([cell_block])
+                            .index(-1)
+                            .build()
+                        )
+                        .build()
+                    )
+                    cell_resp = self.client.docx.v1.document_block_children.create(cell_req)
+                    if not cell_resp.success():
+                        logger.debug(
+                            "表格单元格填充失败 [%d,%d]: code=%s msg=%s",
+                            row_idx, col_idx, cell_resp.code, cell_resp.msg,
+                        )
+
+            logger.info("表格创建完成: %d 行 %d 列", row_count, col_count)
+
+        except Exception as e:
+            logger.warning("表格创建异常 (%dx%d): %s，回退跳过此表格", row_count, col_count, e)
